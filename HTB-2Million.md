@@ -6,7 +6,7 @@
 ![Status](https://img.shields.io/badge/Status-Rooted-success)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
-> **Author:** `<YOUR NAME>` — `<your.email@example.com>` — [LinkedIn](#) · [HTB Profile](#)
+> **Author:** `John Dinglasan` — `john.dinglasan@outlook.it` — [LinkedIn](https://www.linkedin.com/in/john-ed-dinglasan-7090a6390/) · [HTB Profile](https://app.hackthebox.com/users/1411486)
 > **Report date:** 2026-11-22
 > **Classification:** Public — Educational
 
